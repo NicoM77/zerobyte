@@ -9,17 +9,10 @@ export default defineConfig({
 	plugins: [
 		tanstackStart({
 			srcDirectory: "app",
-			router: {
-				routesDirectory: "routes",
-			},
-			importProtection: {
-				behavior: "error",
-			},
+			router: { routesDirectory: "routes" },
+			importProtection: { behavior: "error" },
 		}),
-		nitro({
-			preset: "bun",
-			plugins: ["./app/server/plugins/bootstrap.ts"],
-		}),
+		nitro({ preset: "bun", plugins: ["./app/server/plugins/bootstrap.ts"] }),
 		viteReact(),
 		babel({ presets: [reactCompilerPreset()] }),
 		tailwindcss(),
@@ -51,6 +44,7 @@ export default defineConfig({
 		},
 		options: {
 			typeAware: true,
+			typeCheck: true,
 		},
 		rules: {
 			"no-unused-vars": [
@@ -78,7 +72,7 @@ export default defineConfig({
 		],
 	},
 	staged: {
-		"*.{js,jsx,ts,tsx,json,jsonc}": "vp fmt --write",
+		"*.{js,jsx,ts,tsx,json,jsonc}": "vp check --fix",
 	},
 	run: {
 		cache: {

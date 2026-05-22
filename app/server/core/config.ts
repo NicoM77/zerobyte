@@ -1,37 +1,18 @@
 import { readFileSync } from "node:fs";
-import os from "node:os";
 import { prettifyError, z } from "zod";
 import "dotenv/config";
+import { resolveResticHostname } from "../../../apps/agent/src/restic/hostname";
 import { buildAllowedHosts } from "../lib/auth/base-url";
 import { toMessage } from "@zerobyte/core/utils";
 
 const unquote = (str: string) => str.trim().replace(/^(['"])(.*)\1$/, "$2");
-const getResticHostname = () => {
-	try {
-		const mountinfo = readFileSync("/proc/self/mountinfo", "utf-8");
-		const hostnameLine = mountinfo.split("\n").find((line) => line.includes(" /etc/hostname "));
-		const hostname = os.hostname();
-
-		if (hostnameLine) {
-			const containerIdMatch = hostnameLine.match(/[0-9a-f]{64}/);
-			const containerId = containerIdMatch ? containerIdMatch[0] : null;
-
-			if (containerId?.startsWith(hostname)) {
-				return "zerobyte";
-			}
-
-			return hostname || "zerobyte";
-		}
-	} catch {}
-
-	return "zerobyte";
-};
 
 const envSchema = z
 	.object({
 		NODE_ENV: z.enum(["development", "production", "test"]).default("production"),
 		SERVER_IP: z.string().default("localhost"),
 		SERVER_IDLE_TIMEOUT: z.coerce.number().int().default(60),
+		WEBHOOK_TIMEOUT: z.coerce.number().int().default(60),
 		RESTIC_HOSTNAME: z.string().optional(),
 		PORT: z.coerce.number().int().default(4096),
 		MIGRATIONS_PATH: z.string().optional(),
@@ -44,11 +25,13 @@ const envSchema = z
 		BASE_URL: z.string(),
 		ENABLE_DEV_PANEL: z.string().default("false"),
 		ENABLE_LOCAL_AGENT: z.string().default("false"),
+		WEBHOOK_ALLOWED_ORIGINS: z.string().optional(),
 		PROVISIONING_PATH: z.string().optional(),
 	})
 	.transform((s, ctx) => {
 		const baseUrl = unquote(s.BASE_URL);
 		const trustedOrigins = s.TRUSTED_ORIGINS?.split(",").map(unquote).filter(Boolean).concat(baseUrl) ?? [baseUrl];
+		const webhookAllowedOrigins = s.WEBHOOK_ALLOWED_ORIGINS?.split(",").map(unquote).filter(Boolean) ?? [];
 		const authOrigins = [baseUrl, ...trustedOrigins];
 		const { allowedHosts, invalidOrigins } = buildAllowedHosts(authOrigins);
 		let appSecret = s.APP_SECRET;
@@ -120,7 +103,8 @@ const envSchema = z
 			environment: s.NODE_ENV,
 			serverIp: s.SERVER_IP,
 			serverIdleTimeout: s.SERVER_IDLE_TIMEOUT,
-			resticHostname: s.RESTIC_HOSTNAME || getResticHostname(),
+			webhookTimeout: s.WEBHOOK_TIMEOUT,
+			resticHostname: s.RESTIC_HOSTNAME || resolveResticHostname(),
 			port: s.PORT,
 			migrationsPath: s.MIGRATIONS_PATH,
 			appVersion: s.APP_VERSION,
@@ -136,6 +120,7 @@ const envSchema = z
 			},
 			provisioningPath: s.PROVISIONING_PATH,
 			allowedHosts,
+			webhookAllowedOrigins,
 		};
 	});
 

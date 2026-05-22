@@ -12,7 +12,7 @@ import * as spawnModule from "@zerobyte/core/node";
 import type { SafeSpawnParams } from "@zerobyte/core/node";
 import { logger } from "@zerobyte/core/node";
 import { restic } from "~/server/core/restic";
-import { NotFoundError, BadRequestError } from "http-errors-enhanced";
+import { NotFoundError } from "http-errors-enhanced";
 import { fromAny } from "@total-typescript/shoehorn";
 import { scheduleQueries } from "../backups.queries";
 import { repositoriesService } from "~/server/modules/repositories/repositories.service";
@@ -23,6 +23,7 @@ import { createAgentBackupMocks } from "~/test/helpers/agent-mock";
 import { getScheduleByIdOrShortId } from "../helpers/backup-schedule-lookups";
 import { volumeService } from "~/server/modules/volumes/volume.service";
 import { db } from "~/server/db/db";
+import { config } from "~/server/core/config";
 
 const setup = () => {
 	const resticBackupMock = vi.fn((_: SafeSpawnParams) =>
@@ -49,31 +50,33 @@ const setup = () => {
 	vi.spyOn(agentManager, "runBackup").mockImplementation(runBackupMock);
 	vi.spyOn(agentManager, "cancelBackup").mockImplementation(cancelBackupMock);
 	vi.spyOn(context, "getOrganizationId").mockReturnValue(TEST_ORG_ID);
-	const ensureHealthyVolumeMock = vi.spyOn(volumeService, "ensureHealthyVolume").mockImplementation(async (shortId) => {
-		const volume = await db.query.volumesTable.findFirst({
-			where: {
-				AND: [{ shortId: { eq: shortId } }, { organizationId: TEST_ORG_ID }],
-			},
-		});
+	const ensureHealthyVolumeMock = vi
+		.spyOn(volumeService, "ensureHealthyVolume")
+		.mockImplementation(async (shortId) => {
+			const volume = await db.query.volumesTable.findFirst({
+				where: {
+					AND: [{ shortId: { eq: shortId } }, { organizationId: TEST_ORG_ID }],
+				},
+			});
 
-		if (!volume) {
-			throw new NotFoundError("Volume not found");
-		}
+			if (!volume) {
+				throw new NotFoundError("Volume not found");
+			}
 
-		if (volume.status !== "mounted") {
+			if (volume.status !== "mounted") {
+				return {
+					ready: false as const,
+					volume,
+					reason: "Volume is not mounted",
+				};
+			}
+
 			return {
-				ready: false as const,
+				ready: true as const,
 				volume,
-				reason: "Volume is not mounted",
+				remounted: false,
 			};
-		}
-
-		return {
-			ready: true as const,
-			volume,
-			remounted: false,
-		};
-	});
+		});
 
 	return {
 		resticBackupMock,
@@ -88,10 +91,11 @@ const setup = () => {
 
 afterEach(() => {
 	vi.restoreAllMocks();
+	config.flags.enableLocalAgent = true;
 });
 
 describe("backup execution - validation failures", () => {
-	test("should fail backup when volume is not mounted", async () => {
+	test("does not fail validation when the agent runtime owns volume readiness", async () => {
 		// arrange
 		const { resticBackupMock } = setup();
 		const volume = await createTestVolume({ status: "unmounted" });
@@ -105,55 +109,7 @@ describe("backup execution - validation failures", () => {
 		const result = await backupsService.validateBackupExecution(schedule.id);
 
 		// assert
-		expect(result.type).toBe("failure");
-		if (result.type === "failure") {
-			expect(result.error).toBeInstanceOf(BadRequestError);
-			expect(result.error.message).toBe("Volume is not mounted");
-		}
-		expect(resticBackupMock).not.toHaveBeenCalled();
-	});
-
-	test("runs a preflight volume health check before starting a backup", async () => {
-		setup();
-		const volume = await createTestVolume();
-		const repository = await createTestRepository();
-		const schedule = await createTestBackupSchedule({
-			volumeId: volume.id,
-			repositoryId: repository.id,
-		});
-		const ensureHealthyVolumeSpy = vi.spyOn(volumeService, "ensureHealthyVolume").mockResolvedValue({
-			ready: true,
-			volume,
-			remounted: false,
-		});
-
-		const result = await backupsService.validateBackupExecution(schedule.id);
-
 		expect(result.type).toBe("success");
-		expect(ensureHealthyVolumeSpy).toHaveBeenCalledWith(volume.shortId);
-	});
-
-	test("fails validation when the preflight health check cannot recover the volume", async () => {
-		const { resticBackupMock } = setup();
-		const volume = await createTestVolume();
-		const repository = await createTestRepository();
-		const schedule = await createTestBackupSchedule({
-			volumeId: volume.id,
-			repositoryId: repository.id,
-		});
-		vi.spyOn(volumeService, "ensureHealthyVolume").mockResolvedValue({
-			ready: false,
-			volume: { ...volume, status: "error", lastError: "stale mount" },
-			reason: "stale mount",
-		});
-
-		const result = await backupsService.validateBackupExecution(schedule.id);
-
-		expect(result.type).toBe("failure");
-		if (result.type === "failure") {
-			expect(result.error).toBeInstanceOf(BadRequestError);
-			expect(result.error.message).toBe("stale mount");
-		}
 		expect(resticBackupMock).not.toHaveBeenCalled();
 	});
 
@@ -276,6 +232,129 @@ describe("backup execution - validation failures", () => {
 		).toBe(false);
 	});
 
+	test("passes configured backup webhooks to the backup agent", async () => {
+		const { runBackupMock } = setup();
+		const volume = await createTestVolume();
+		const repository = await createTestRepository();
+		const backupWebhooks = {
+			pre: {
+				url: "http://localhost:8080/stop",
+				headers: ["authorization: Bearer stop-token"],
+				body: '{"action":"stop"}',
+			},
+			post: {
+				url: "http://localhost:8080/start",
+				headers: ["authorization: Bearer start-token"],
+				body: '{"action":"start"}',
+			},
+		};
+
+		const schedule = await createTestBackupSchedule({
+			volumeId: volume.id,
+			repositoryId: repository.id,
+			backupWebhooks,
+		});
+
+		await backupsService.executeBackup(schedule.id);
+
+		expect(runBackupMock).toHaveBeenCalledWith(
+			"local",
+			expect.objectContaining({
+				payload: expect.objectContaining({
+					webhooks: backupWebhooks,
+				}),
+			}),
+		);
+	});
+
+	test("adds ignore-inode by default for FUSE-backed volumes", async () => {
+		const { runBackupMock } = setup();
+		const volume = await createTestVolume({
+			type: "sftp",
+			config: {
+				backend: "sftp",
+				host: "storage.example.com",
+				port: 22,
+				username: "backup",
+				privateKey: "key",
+				path: "/data",
+				skipHostKeyCheck: false,
+			},
+		});
+		const repository = await createTestRepository();
+		const schedule = await createTestBackupSchedule({
+			volumeId: volume.id,
+			repositoryId: repository.id,
+		});
+
+		await backupsService.executeBackup(schedule.id);
+
+		expect(runBackupMock).toHaveBeenCalledWith(
+			"local",
+			expect.objectContaining({
+				payload: expect.objectContaining({
+					options: expect.objectContaining({
+						customResticParams: ["--ignore-inode"],
+					}),
+				}),
+			}),
+		);
+	});
+
+	test("does not add ignore-inode by default for directory volumes", async () => {
+		const { runBackupMock } = setup();
+		const volume = await createTestVolume();
+		const repository = await createTestRepository();
+		const schedule = await createTestBackupSchedule({
+			volumeId: volume.id,
+			repositoryId: repository.id,
+		});
+
+		await backupsService.executeBackup(schedule.id);
+
+		expect(runBackupMock).toHaveBeenCalledWith(
+			"local",
+			expect.objectContaining({
+				payload: expect.objectContaining({
+					options: expect.objectContaining({
+						customResticParams: [],
+					}),
+				}),
+			}),
+		);
+	});
+
+	test("does not duplicate ignore-inode when already configured", async () => {
+		const { runBackupMock } = setup();
+		const volume = await createTestVolume({
+			type: "rclone",
+			config: {
+				backend: "rclone",
+				remote: "remote",
+				path: "/data",
+			},
+		});
+		const repository = await createTestRepository();
+		const schedule = await createTestBackupSchedule({
+			volumeId: volume.id,
+			repositoryId: repository.id,
+			customResticParams: ["--ignore-inode"],
+		});
+
+		await backupsService.executeBackup(schedule.id);
+
+		expect(runBackupMock).toHaveBeenCalledWith(
+			"local",
+			expect.objectContaining({
+				payload: expect.objectContaining({
+					options: expect.objectContaining({
+						customResticParams: ["--ignore-inode"],
+					}),
+				}),
+			}),
+		);
+	});
+
 	test("should fail backup when the local agent is unavailable", async () => {
 		const { runBackupMock } = setup();
 		const volume = await createTestVolume();
@@ -298,9 +377,57 @@ describe("backup execution - validation failures", () => {
 	});
 });
 
+describe("backup execution - routing", () => {
+	test("fails local repository backups on non-local volume agents", async () => {
+		const { runBackupMock } = setup();
+		const volume = await createTestVolume({ agentId: "agent-remote" });
+		const repository = await createTestRepository();
+		const schedule = await createTestBackupSchedule({
+			volumeId: volume.id,
+			repositoryId: repository.id,
+		});
+
+		await backupsService.executeBackup(schedule.id);
+
+		const updatedSchedule = await getScheduleByIdOrShortId(schedule.id);
+		expect(updatedSchedule.lastBackupStatus).toBe("error");
+		expect(updatedSchedule.lastBackupError).toBe(
+			`Local repository "${repository.name}" can only be used with the local agent`,
+		);
+		expect(runBackupMock).not.toHaveBeenCalled();
+	});
+
+	test("routes remote repository backups through the owning volume agent", async () => {
+		const { runBackupMock } = setup();
+		const volume = await createTestVolume({ agentId: "agent-remote" });
+		const repository = await createTestRepository({
+			type: "s3",
+			config: {
+				backend: "s3",
+				endpoint: "https://s3.amazonaws.com",
+				bucket: "bucket-name",
+				accessKeyId: "access-key",
+				secretAccessKey: "secret-key",
+			},
+		});
+		const schedule = await createTestBackupSchedule({
+			volumeId: volume.id,
+			repositoryId: repository.id,
+		});
+
+		await backupsService.executeBackup(schedule.id);
+
+		expect(runBackupMock).toHaveBeenCalledWith(
+			"agent-remote",
+			expect.objectContaining({ scheduleId: schedule.id }),
+		);
+	});
+});
+
 describe("stop backup", () => {
 	test("should keep restic warning details when backup completes with read errors", async () => {
 		const { resticBackupMock } = setup();
+		const notificationSpy = vi.spyOn(notificationsService, "sendBackupNotification").mockResolvedValue();
 		const volume = await createTestVolume();
 		const repository = await createTestRepository();
 		const schedule = await createTestBackupSchedule({
@@ -323,6 +450,11 @@ describe("stop backup", () => {
 		const updatedSchedule = await getScheduleByIdOrShortId(schedule.id);
 		expect(updatedSchedule.lastBackupStatus).toBe("warning");
 		expect(updatedSchedule.lastBackupError).toBe("error: open /mnt/data/private.db: permission denied");
+		expect(notificationSpy).toHaveBeenLastCalledWith(
+			schedule.id,
+			"warning",
+			expect.objectContaining({ error: "error: open /mnt/data/private.db: permission denied" }),
+		);
 	});
 
 	test("should store restic diagnostic details instead of the generic summary on hard failure", async () => {
@@ -701,7 +833,9 @@ describe("retention policy - runForget", () => {
 		});
 
 		// act & assert
-		await expect(backupsService.runForget(schedule.id, "non-existent-repo")).rejects.toThrow("Repository not found");
+		await expect(backupsService.runForget(schedule.id, "non-existent-repo")).rejects.toThrow(
+			"Repository not found",
+		);
 	});
 });
 

@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { AuthLayout } from "~/client/components/auth-layout";
@@ -10,6 +10,7 @@ import { InputOTP, InputOTPGroup, InputOTPSeparator, InputOTPSlot } from "~/clie
 import { Label } from "~/client/components/ui/label";
 import { authClient } from "~/client/lib/auth-client";
 import { logger } from "~/client/lib/logger";
+import { RECOVERY_KEY_DOWNLOAD_SKIPPED_COOKIE_NAME } from "~/lib/recovery-key-skip";
 import { decodeLoginError, getLoginErrorDescription } from "~/client/lib/sso-errors";
 import { ResetPasswordDialog } from "../components/reset-password-dialog";
 import { useNavigate } from "@tanstack/react-router";
@@ -32,6 +33,12 @@ type LoginPageProps = {
 	error?: string;
 };
 
+function hasSkippedRecoveryKeyDownload(userId: string) {
+	return document.cookie
+		.split(";")
+		.some((cookie) => cookie.trim() === `${RECOVERY_KEY_DOWNLOAD_SKIPPED_COOKIE_NAME}=${userId}`);
+}
+
 export function LoginPage({ error }: LoginPageProps = {}) {
 	const navigate = useNavigate();
 	const [showResetDialog, setShowResetDialog] = useState(false);
@@ -42,6 +49,39 @@ export function LoginPage({ error }: LoginPageProps = {}) {
 	const [trustDevice, setTrustDevice] = useState(false);
 	const errorCode = decodeLoginError(error);
 	const errorDescription = errorCode ? getLoginErrorDescription(errorCode) : null;
+
+	useEffect(() => {
+		const autoSignIn = async () => {
+			if (
+				typeof PublicKeyCredential === "undefined" ||
+				!PublicKeyCredential.isConditionalMediationAvailable ||
+				!(await PublicKeyCredential.isConditionalMediationAvailable())
+			) {
+				return;
+			}
+
+			await authClient.signIn.passkey({
+				autoFill: true,
+				fetchOptions: {
+					onResponse: async () => {
+						const session = await authClient.getSession();
+
+						if (
+							session.data?.user &&
+							!session.data.user.hasDownloadedResticPassword &&
+							!hasSkippedRecoveryKeyDownload(session.data.user.id)
+						) {
+							void navigate({ to: "/download-recovery-key" });
+						} else {
+							void navigate({ to: "/volumes" });
+						}
+					},
+				},
+			});
+		};
+
+		void autoSignIn();
+	}, [navigate]);
 
 	const form = useForm<LoginFormValues>({
 		resolver: zodResolver(loginSchema),
@@ -77,7 +117,7 @@ export function LoginPage({ error }: LoginPageProps = {}) {
 		}
 
 		const d = await authClient.getSession();
-		if (data.user && !d.data?.user.hasDownloadedResticPassword) {
+		if (data.user && !d.data?.user.hasDownloadedResticPassword && !hasSkippedRecoveryKeyDownload(data.user.id)) {
 			void navigate({ to: "/download-recovery-key" });
 		} else {
 			void navigate({ to: "/volumes" });
@@ -113,7 +153,11 @@ export function LoginPage({ error }: LoginPageProps = {}) {
 		if (data) {
 			toast.success("Login successful");
 			const session = await authClient.getSession();
-			if (session.data?.user && !session.data.user.hasDownloadedResticPassword) {
+			if (
+				session.data?.user &&
+				!session.data.user.hasDownloadedResticPassword &&
+				!hasSkippedRecoveryKeyDownload(session.data.user.id)
+			) {
 				void navigate({ to: "/download-recovery-key" });
 			} else {
 				void navigate({ to: "/volumes" });
@@ -130,7 +174,10 @@ export function LoginPage({ error }: LoginPageProps = {}) {
 
 	if (requires2FA) {
 		return (
-			<AuthLayout title="Two-Factor Authentication" description="Enter the 6-digit code from your authenticator app">
+			<AuthLayout
+				title="Two-Factor Authentication"
+				description="Enter the 6-digit code from your authenticator app"
+			>
 				<div className="space-y-6">
 					<div className="space-y-4 flex flex-col items-center">
 						<Label htmlFor="totp-code">Authentication code</Label>
@@ -199,7 +246,11 @@ export function LoginPage({ error }: LoginPageProps = {}) {
 		<AuthLayout title="Login to your account" description="Enter your credentials below to login to your account">
 			<Form {...form}>
 				<form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-					<div className={cn("rounded-md border border-destructive/50 p-3 text-sm", { hidden: !errorDescription })}>
+					<div
+						className={cn("rounded-md border border-destructive/50 p-3 text-sm", {
+							hidden: !errorDescription,
+						})}
+					>
 						{errorDescription}
 					</div>
 					<FormField
@@ -209,7 +260,13 @@ export function LoginPage({ error }: LoginPageProps = {}) {
 							<FormItem>
 								<FormLabel>Username</FormLabel>
 								<FormControl>
-									<Input {...field} type="text" placeholder="admin" disabled={isLoggingIn} />
+									<Input
+										{...field}
+										type="text"
+										placeholder="admin"
+										disabled={isLoggingIn}
+										autoComplete="username webauthn"
+									/>
 								</FormControl>
 								<FormMessage />
 							</FormItem>
@@ -231,7 +288,12 @@ export function LoginPage({ error }: LoginPageProps = {}) {
 									</button>
 								</div>
 								<FormControl>
-									<Input {...field} type="password" disabled={isLoggingIn} />
+									<Input
+										{...field}
+										type="password"
+										disabled={isLoggingIn}
+										autoComplete="current-password webauthn"
+									/>
 								</FormControl>
 								<FormMessage />
 							</FormItem>
